@@ -94,7 +94,7 @@ namespace satdump
                 if (!spline_transform->add_point(afXY[0], afXY[1], afPL))
                 {
                     logger->error("Error generating transformer!");
-                    // return 1;
+                    // Handle error appropriately
                 }
             }
 
@@ -177,7 +177,7 @@ namespace satdump
 
         void ImageWarper::warpOnCPU(WarpResult &result)
         {
-            // Now, warp the image
+            // Warp the image on CPU
             auto cpu_start = std::chrono::system_clock::now();
             {
 #pragma omp parallel for
@@ -188,22 +188,24 @@ namespace satdump
                     int x = (xy_ptr % result.output_image.width());
                     int y = (xy_ptr / result.output_image.width());
 
-                    // Scale to the map
+                    // Map pixel coordinates to latitude and longitude
                     double lat = -((double)(y + crop_set.y_min) / (double)op.output_height) * 180 + 90;
                     double lon = ((double)(x + crop_set.x_min) / (double)op.output_width) * 360 - 180;
 
-                    // Perform TPS
+                    // Apply TPS transformation
                     shift_latlon_by_lat(&lat, &lon, op.shift_lat);
                     tps->get_point(lon_shift(lon, op.shift_lon), lat, xy);
                     xx = xy[0];
                     yy = xy[1];
 
+                    // Bounds checking
                     if (xx < 0 || yy < 0)
                         continue;
 
                     if ((int)xx > (int)op.input_image->width() - 1 || (int)yy > (int)op.input_image->height() - 1)
                         continue;
 
+                    // Pixel value retrieval and assignment
                     if (result.output_image.channels() == 4)
                     {
                         if (op.input_image->channels() == 1)
@@ -216,7 +218,7 @@ namespace satdump
                         if (op.input_image->channels() == 4)
                             result.output_image.set(3, y * result.output_image.width() + x, op.input_image->get_pixel_bilinear(3, xx, yy));
                         else
-                            result.output_image.set(3, y * result.output_image.width() + x, 65535);
+                            result.output_image.set(3, y * result.output_image.width() + x, 4294967295U);
                     }
                     else
                     {
@@ -230,111 +232,6 @@ namespace satdump
         }
 
 #ifdef USE_OPENCL
-        void ImageWarper::warpOnGPU_fp64(WarpResult &result)
-        {
-            // Build GPU Kernel
-            cl_program warping_program = opencl::buildCLKernel(resources::getResourcePath("opencl/warp_image_thin_plate_spline_fp64.cl"));
-
-            cl_int err = 0;
-            auto &context = satdump::opencl::ocl_context;
-            auto &device = satdump::opencl::ocl_device;
-
-            // Now, run the actual OpenCL Kernel
-            auto gpu_start = std::chrono::system_clock::now();
-            {
-                // Images
-                cl_mem buffer_map = clCreateBuffer(context, CL_MEM_READ_WRITE, sizeof(uint16_t) * result.output_image.size(), NULL, &err);
-                if (err != CL_SUCCESS)
-                    throw satdump_exception("Couldn't load buffer_map! Code " + std::to_string(err));
-                cl_mem buffer_img = clCreateBuffer(context, CL_MEM_READ_WRITE, sizeof(uint16_t) * op.input_image->size(), NULL, &err);
-                if (err != CL_SUCCESS)
-                    throw satdump_exception("Couldn't load buffer_img! Code " + std::to_string(err));
-
-                // TPS Stuff
-                cl_mem buffer_tps_npoints = clCreateBuffer(context, CL_MEM_READ_WRITE, sizeof(int), NULL, &err);
-                cl_mem buffer_tps_x = clCreateBuffer(context, CL_MEM_READ_WRITE, sizeof(double) * tps->_nof_points, NULL, &err);
-                cl_mem buffer_tps_y = clCreateBuffer(context, CL_MEM_READ_WRITE, sizeof(double) * tps->_nof_points, NULL, &err);
-                cl_mem buffer_tps_coefs1 = clCreateBuffer(context, CL_MEM_READ_WRITE, sizeof(double) * tps->_nof_eqs, NULL, &err);
-                cl_mem buffer_tps_coefs2 = clCreateBuffer(context, CL_MEM_READ_WRITE, sizeof(double) * tps->_nof_eqs, NULL, &err);
-                cl_mem buffer_tps_xmean = clCreateBuffer(context, CL_MEM_READ_WRITE, sizeof(double), NULL, &err);
-                cl_mem buffer_tps_ymean = clCreateBuffer(context, CL_MEM_READ_WRITE, sizeof(double), NULL, &err);
-
-                int img_settings[] = {op.output_width, op.output_height,
-                                      (int)op.input_image->width(), (int)op.input_image->height(),
-                                      op.input_image->channels(),
-                                      result.output_image.channels(),
-                                      crop_set.y_min, crop_set.y_max,
-                                      crop_set.x_min, crop_set.x_max,
-                                      op.shift_lon, op.shift_lat};
-
-                cl_mem buffer_img_settings = clCreateBuffer(context, CL_MEM_READ_WRITE, sizeof(int) * 12, NULL, &err);
-
-                // Create an OpenCL queue
-                cl_command_queue queue = clCreateCommandQueue(context, device, 0, &err);
-                if (err != CL_SUCCESS)
-                    throw satdump_exception("Couldn't create OpenCL queue! Code " + std::to_string(err));
-
-                // Write all of buffers to the GPU
-                clEnqueueWriteBuffer(queue, buffer_map, true, 0, sizeof(uint16_t) * result.output_image.size(), result.output_image.raw_data(), 0, NULL, NULL);
-                clEnqueueWriteBuffer(queue, buffer_img, true, 0, sizeof(uint16_t) * op.input_image->size(), op.input_image->raw_data(), 0, NULL, NULL);
-                clEnqueueWriteBuffer(queue, buffer_tps_npoints, true, 0, sizeof(int), &tps->_nof_points, 0, NULL, NULL);
-                clEnqueueWriteBuffer(queue, buffer_tps_x, true, 0, sizeof(double) * tps->_nof_points, tps->x, 0, NULL, NULL);
-                clEnqueueWriteBuffer(queue, buffer_tps_y, true, 0, sizeof(double) * tps->_nof_points, tps->y, 0, NULL, NULL);
-                clEnqueueWriteBuffer(queue, buffer_tps_coefs1, true, 0, sizeof(double) * tps->_nof_eqs, tps->coef[0], 0, NULL, NULL);
-                clEnqueueWriteBuffer(queue, buffer_tps_coefs2, true, 0, sizeof(double) * tps->_nof_eqs, tps->coef[1], 0, NULL, NULL);
-                clEnqueueWriteBuffer(queue, buffer_tps_xmean, true, 0, sizeof(double), &tps->x_mean, 0, NULL, NULL);
-                clEnqueueWriteBuffer(queue, buffer_tps_ymean, true, 0, sizeof(double), &tps->y_mean, 0, NULL, NULL);
-                clEnqueueWriteBuffer(queue, buffer_img_settings, true, 0, sizeof(int) * 12, img_settings, 0, NULL, NULL);
-
-                // Init the kernel
-                cl_kernel warping_kernel = clCreateKernel(warping_program, "warp_image_thin_plate_spline", &err);
-                clSetKernelArg(warping_kernel, 0, sizeof(cl_mem), &buffer_map);
-                clSetKernelArg(warping_kernel, 1, sizeof(cl_mem), &buffer_img);
-                clSetKernelArg(warping_kernel, 2, sizeof(cl_mem), &buffer_tps_npoints);
-                clSetKernelArg(warping_kernel, 3, sizeof(cl_mem), &buffer_tps_x);
-                clSetKernelArg(warping_kernel, 4, sizeof(cl_mem), &buffer_tps_y);
-                clSetKernelArg(warping_kernel, 5, sizeof(cl_mem), &buffer_tps_coefs1);
-                clSetKernelArg(warping_kernel, 6, sizeof(cl_mem), &buffer_tps_coefs2);
-                clSetKernelArg(warping_kernel, 7, sizeof(cl_mem), &buffer_tps_xmean);
-                clSetKernelArg(warping_kernel, 8, sizeof(cl_mem), &buffer_tps_ymean);
-                clSetKernelArg(warping_kernel, 9, sizeof(cl_mem), &buffer_img_settings);
-
-                // Get proper workload size
-                size_t size_wg = 0;
-                size_t compute_units = 0;
-                clGetDeviceInfo(device, CL_DEVICE_MAX_WORK_GROUP_SIZE, sizeof(size_t), &size_wg, NULL);
-                clGetDeviceInfo(device, CL_DEVICE_MAX_COMPUTE_UNITS, sizeof(size_t), &compute_units, NULL);
-
-                logger->debug("Workgroup size %d", size_wg * compute_units);
-
-                // Run the kernel!
-                size_t total_wg_size = int(size_wg) * int(compute_units);
-                err = clEnqueueNDRangeKernel(queue, warping_kernel, 1, NULL, &total_wg_size, NULL, 0, NULL, NULL);
-                if (err != CL_SUCCESS)
-                    throw satdump_exception("Couldn't clEnqueueNDRangeKernel! Code " + std::to_string(err));
-
-                // Read image result back from VRAM
-                clEnqueueReadBuffer(queue, buffer_map, true, 0, sizeof(uint16_t) * result.output_image.size(), result.output_image.raw_data(), 0, NULL, NULL);
-
-                // Free up everything
-                clReleaseMemObject(buffer_img);
-                clReleaseMemObject(buffer_map);
-                clReleaseMemObject(buffer_tps_npoints);
-                clReleaseMemObject(buffer_tps_x);
-                clReleaseMemObject(buffer_tps_y);
-                clReleaseMemObject(buffer_tps_coefs1);
-                clReleaseMemObject(buffer_tps_coefs2);
-                clReleaseMemObject(buffer_tps_xmean);
-                clReleaseMemObject(buffer_tps_ymean);
-                clReleaseMemObject(buffer_img_settings);
-                clReleaseKernel(warping_kernel);
-                // clReleaseProgram(warping_program);
-                clReleaseCommandQueue(queue);
-            }
-            auto gpu_time = (std::chrono::system_clock::now() - gpu_start);
-            logger->debug("GPU Processing Time %f", gpu_time.count() / 1e9);
-        }
-
         void ImageWarper::warpOnGPU_fp32(WarpResult &result)
         {
             // Build GPU Kernel
@@ -347,69 +244,190 @@ namespace satdump
             // Now, run the actual OpenCL Kernel
             auto gpu_start = std::chrono::system_clock::now();
             {
+
                 // Images
-                cl_mem buffer_map = clCreateBuffer(context, CL_MEM_READ_WRITE, sizeof(uint16_t) * result.output_image.size(), NULL, &err);
+                cl_mem buffer_map = clCreateBuffer(context, CL_MEM_READ_WRITE, sizeof(uint32_t) * result.output_image.size(), NULL, &err);
                 if (err != CL_SUCCESS)
-                    throw satdump_exception("Couldn't load buffer_map! Code " + std::to_string(err));
-                cl_mem buffer_img = clCreateBuffer(context, CL_MEM_READ_WRITE, sizeof(uint16_t) * op.input_image->size(), NULL, &err);
+                    throw satdump_exception("Couldn't create buffer_map! Code " + std::to_string(err));
+
+                cl_mem buffer_img = clCreateBuffer(context, CL_MEM_READ_ONLY, sizeof(uint32_t) * op.input_image->size(), NULL, &err);
                 if (err != CL_SUCCESS)
-                    throw satdump_exception("Couldn't load buffer_img! Code " + std::to_string(err));
+                    throw satdump_exception("Couldn't create buffer_img! Code " + std::to_string(err));
 
-                // TPS Stuff
-                cl_mem buffer_tps_npoints = clCreateBuffer(context, CL_MEM_READ_WRITE, sizeof(float) * tps->_nof_points, NULL, &err);
-                cl_mem buffer_tps_x = clCreateBuffer(context, CL_MEM_READ_WRITE, sizeof(float) * tps->_nof_points, NULL, &err);
-                cl_mem buffer_tps_y = clCreateBuffer(context, CL_MEM_READ_WRITE, sizeof(float) * tps->_nof_points, NULL, &err);
-                cl_mem buffer_tps_coefs1 = clCreateBuffer(context, CL_MEM_READ_WRITE, sizeof(float) * tps->_nof_eqs, NULL, &err);
-                cl_mem buffer_tps_coefs2 = clCreateBuffer(context, CL_MEM_READ_WRITE, sizeof(float) * tps->_nof_eqs, NULL, &err);
-                cl_mem buffer_tps_xmean = clCreateBuffer(context, CL_MEM_READ_WRITE, sizeof(float), NULL, &err);
-                cl_mem buffer_tps_ymean = clCreateBuffer(context, CL_MEM_READ_WRITE, sizeof(float), NULL, &err);
+                // TPS Data
+                cl_mem buffer_tps_x = clCreateBuffer(context, CL_MEM_READ_ONLY, sizeof(float) * tps->_nof_points, NULL, &err);
+                if (err != CL_SUCCESS)
+                    throw satdump_exception("Couldn't create buffer_tps_x! Code " + std::to_string(err));
 
-                int img_settings[] = {op.output_width, op.output_height,
-                                      (int)op.input_image->width(), (int)op.input_image->height(),
-                                      op.input_image->channels(),
-                                      result.output_image.channels(),
-                                      crop_set.y_min, crop_set.y_max,
-                                      crop_set.x_min, crop_set.x_max,
-                                      op.shift_lon, op.shift_lat};
+                cl_mem buffer_tps_y = clCreateBuffer(context, CL_MEM_READ_ONLY, sizeof(float) * tps->_nof_points, NULL, &err);
+                if (err != CL_SUCCESS)
+                    throw satdump_exception("Couldn't create buffer_tps_y! Code " + std::to_string(err));
 
-                cl_mem buffer_img_settings = clCreateBuffer(context, CL_MEM_READ_WRITE, sizeof(int) * 12, NULL, &err);
+                cl_mem buffer_tps_coefs1 = clCreateBuffer(context, CL_MEM_READ_ONLY, sizeof(float) * tps->_nof_eqs, NULL, &err);
+                if (err != CL_SUCCESS)
+                    throw satdump_exception("Couldn't create buffer_tps_coefs1! Code " + std::to_string(err));
+
+                cl_mem buffer_tps_coefs2 = clCreateBuffer(context, CL_MEM_READ_ONLY, sizeof(float) * tps->_nof_eqs, NULL, &err);
+                if (err != CL_SUCCESS)
+                    throw satdump_exception("Couldn't create buffer_tps_coefs2! Code " + std::to_string(err));
+
+                // Image settings
+                int img_settings[] = {
+                    op.output_width,             // map_img_width
+                    op.output_height,            // map_img_height
+                    (int)op.input_image->width(),  // img_width
+                    (int)op.input_image->height(), // img_height
+                    op.input_image->channels(),  // source_channels
+                    result.output_image.channels(), // target_channels
+                    crop_set.y_min,              // crop_y_min
+                    crop_set.y_max,              // crop_y_max
+                    crop_set.x_min,              // crop_x_min
+                    crop_set.x_max,              // crop_x_max
+                    op.shift_lon,                // lon_shiftv
+                    op.shift_lat                 // lat_shiftv
+                };
+
+                cl_mem buffer_img_settings = clCreateBuffer(context, CL_MEM_READ_ONLY, sizeof(int) * 12, NULL, &err);
+                if (err != CL_SUCCESS)
+                    throw satdump_exception("Couldn't create buffer_img_settings! Code " + std::to_string(err));
 
                 // Create an OpenCL queue
                 cl_command_queue queue = clCreateCommandQueue(context, device, 0, &err);
                 if (err != CL_SUCCESS)
                     throw satdump_exception("Couldn't create OpenCL queue! Code " + std::to_string(err));
 
-                // Write all of buffers to the GPU, also converting to FP32
-                clEnqueueWriteBuffer(queue, buffer_map, true, 0, sizeof(uint16_t) * result.output_image.size(), result.output_image.raw_data(), 0, NULL, NULL);
-                clEnqueueWriteBuffer(queue, buffer_img, true, 0, sizeof(uint16_t) * op.input_image->size(), op.input_image->raw_data(), 0, NULL, NULL);
-                clEnqueueWriteBuffer(queue, buffer_tps_npoints, true, 0, sizeof(int), &tps->_nof_points, 0, NULL, NULL);
-                std::vector<float> tps_x = double_buffer_to_float(tps->x, tps->_nof_points);
-                std::vector<float> tps_y = double_buffer_to_float(tps->y, tps->_nof_points);
-                std::vector<float> tps_coef1 = double_buffer_to_float(tps->coef[0], tps->_nof_eqs);
-                std::vector<float> tps_coef2 = double_buffer_to_float(tps->coef[1], tps->_nof_eqs);
-                float tps_x_mean = tps->x_mean;
-                float tps_y_mean = tps->y_mean;
-                clEnqueueWriteBuffer(queue, buffer_tps_x, true, 0, sizeof(float) * tps->_nof_points, tps_x.data(), 0, NULL, NULL);
-                clEnqueueWriteBuffer(queue, buffer_tps_y, true, 0, sizeof(float) * tps->_nof_points, tps_y.data(), 0, NULL, NULL);
-                clEnqueueWriteBuffer(queue, buffer_tps_coefs1, true, 0, sizeof(float) * tps->_nof_eqs, tps_coef1.data(), 0, NULL, NULL);
-                clEnqueueWriteBuffer(queue, buffer_tps_coefs2, true, 0, sizeof(float) * tps->_nof_eqs, tps_coef2.data(), 0, NULL, NULL);
-                clEnqueueWriteBuffer(queue, buffer_tps_xmean, true, 0, sizeof(float), &tps_x_mean, 0, NULL, NULL);
-                clEnqueueWriteBuffer(queue, buffer_tps_ymean, true, 0, sizeof(float), &tps_y_mean, 0, NULL, NULL);
-                clEnqueueWriteBuffer(queue, buffer_img_settings, true, 0, sizeof(int) * 12, img_settings, 0, NULL, NULL);
+                // Convert and transfer image data to GPU
+                uint16_t* input_image_raw_data = static_cast<uint16_t*>(op.input_image->raw_data());
+                size_t input_image_size = op.input_image->size();
+                std::vector<uint32_t> input_image_data(input_image_size);
+                for (size_t i = 0; i < input_image_size; ++i) {
+                    input_image_data[i] = static_cast<uint32_t>(input_image_raw_data[i]);
+                }
 
-                // Init the kernel
+                err = clEnqueueWriteBuffer(queue, buffer_img, CL_TRUE, 0, sizeof(uint32_t) * input_image_size, input_image_data.data(), 0, NULL, NULL);
+                if (err != CL_SUCCESS)
+                    throw satdump_exception("Couldn't write to buffer_img! Code " + std::to_string(err));
+
+                // Initialize output image data to zero
+                size_t output_image_size = result.output_image.size();
+                std::vector<uint32_t> output_image_data(output_image_size, 0);
+
+                err = clEnqueueWriteBuffer(queue, buffer_map, CL_TRUE, 0, sizeof(uint32_t) * output_image_size, output_image_data.data(), 0, NULL, NULL);
+                if (err != CL_SUCCESS)
+                    throw satdump_exception("Couldn't write to buffer_map! Code " + std::to_string(err));
+
+                // Write TPS data to GPU
+                // Convert TPS data to float
+                std::vector<float> tps_x(tps->_nof_points);
+                for (int i = 0; i < tps->_nof_points; ++i) {
+                    tps_x[i] = static_cast<float>(tps->x[i]);
+                }
+                std::vector<float> tps_y(tps->_nof_points);
+                for (int i = 0; i < tps->_nof_points; ++i) {
+                    tps_y[i] = static_cast<float>(tps->y[i]);
+                }
+                std::vector<float> tps_coef1(tps->_nof_eqs);
+                for (int i = 0; i < tps->_nof_eqs; ++i) {
+                    tps_coef1[i] = static_cast<float>(tps->coef[0][i]);
+                }
+                std::vector<float> tps_coef2(tps->_nof_eqs);
+                for (int i = 0; i < tps->_nof_eqs; ++i) {
+                    tps_coef2[i] = static_cast<float>(tps->coef[1][i]);
+                }
+                float tps_x_mean = static_cast<float>(tps->x_mean);
+                float tps_y_mean = static_cast<float>(tps->y_mean);
+
+                err = clEnqueueWriteBuffer(queue, buffer_tps_x, CL_TRUE, 0, sizeof(float) * tps->_nof_points, tps_x.data(), 0, NULL, NULL);
+                if (err != CL_SUCCESS)
+                    throw satdump_exception("Couldn't write to buffer_tps_x! Code " + std::to_string(err));
+
+                err = clEnqueueWriteBuffer(queue, buffer_tps_y, CL_TRUE, 0, sizeof(float) * tps->_nof_points, tps_y.data(), 0, NULL, NULL);
+                if (err != CL_SUCCESS)
+                    throw satdump_exception("Couldn't write to buffer_tps_y! Code " + std::to_string(err));
+
+                err = clEnqueueWriteBuffer(queue, buffer_tps_coefs1, CL_TRUE, 0, sizeof(float) * tps->_nof_eqs, tps_coef1.data(), 0, NULL, NULL);
+                if (err != CL_SUCCESS)
+                    throw satdump_exception("Couldn't write to buffer_tps_coefs1! Code " + std::to_string(err));
+
+                err = clEnqueueWriteBuffer(queue, buffer_tps_coefs2, CL_TRUE, 0, sizeof(float) * tps->_nof_eqs, tps_coef2.data(), 0, NULL, NULL);
+                if (err != CL_SUCCESS)
+                    throw satdump_exception("Couldn't write to buffer_tps_coefs2! Code " + std::to_string(err));
+
+                // Write image settings
+                err = clEnqueueWriteBuffer(queue, buffer_img_settings, CL_TRUE, 0, sizeof(int) * 12, img_settings, 0, NULL, NULL);
+                if (err != CL_SUCCESS)
+                    throw satdump_exception("Couldn't write to buffer_img_settings! Code " + std::to_string(err));
+
+                // Initialize the kernel
                 cl_kernel warping_kernel = clCreateKernel(warping_program, "warp_image_thin_plate_spline", &err);
-                clSetKernelArg(warping_kernel, 0, sizeof(cl_mem), &buffer_map);
-                clSetKernelArg(warping_kernel, 1, sizeof(cl_mem), &buffer_img);
-                clSetKernelArg(warping_kernel, 2, sizeof(cl_mem), &buffer_tps_npoints);
-                clSetKernelArg(warping_kernel, 3, sizeof(cl_mem), &buffer_tps_x);
-                clSetKernelArg(warping_kernel, 4, sizeof(cl_mem), &buffer_tps_y);
-                clSetKernelArg(warping_kernel, 5, sizeof(cl_mem), &buffer_tps_coefs1);
-                clSetKernelArg(warping_kernel, 6, sizeof(cl_mem), &buffer_tps_coefs2);
-                clSetKernelArg(warping_kernel, 7, sizeof(cl_mem), &buffer_tps_xmean);
-                clSetKernelArg(warping_kernel, 8, sizeof(cl_mem), &buffer_tps_ymean);
-                clSetKernelArg(warping_kernel, 9, sizeof(cl_mem), &buffer_img_settings);
+                if (err != CL_SUCCESS)
+                    throw satdump_exception("Couldn't create kernel! Code " + std::to_string(err));
 
+                // Set kernel arguments
+                err = clSetKernelArg(warping_kernel, 0, sizeof(cl_mem), &buffer_map);
+                if (err != CL_SUCCESS)
+                    throw satdump_exception("Couldn't set kernel arg 0! Code " + std::to_string(err));
+
+                err = clSetKernelArg(warping_kernel, 1, sizeof(cl_mem), &buffer_img);
+                if (err != CL_SUCCESS)
+                    throw satdump_exception("Couldn't set kernel arg 1! Code " + std::to_string(err));
+
+                // Pass scalar values directly
+                err = clSetKernelArg(warping_kernel, 2, sizeof(int), &tps->_nof_points);
+                if (err != CL_SUCCESS)
+                    throw satdump_exception("Couldn't set kernel arg 2! Code " + std::to_string(err));
+
+                err = clSetKernelArg(warping_kernel, 3, sizeof(cl_mem), &buffer_tps_x);
+                if (err != CL_SUCCESS)
+                    throw satdump_exception("Couldn't set kernel arg 3! Code " + std::to_string(err));
+
+                err = clSetKernelArg(warping_kernel, 4, sizeof(cl_mem), &buffer_tps_y);
+                if (err != CL_SUCCESS)
+                    throw satdump_exception("Couldn't set kernel arg 4! Code " + std::to_string(err));
+
+                err = clSetKernelArg(warping_kernel, 5, sizeof(cl_mem), &buffer_tps_coefs1);
+                if (err != CL_SUCCESS)
+                    throw satdump_exception("Couldn't set kernel arg 5! Code " + std::to_string(err));
+
+                err = clSetKernelArg(warping_kernel, 6, sizeof(cl_mem), &buffer_tps_coefs2);
+                if (err != CL_SUCCESS)
+                    throw satdump_exception("Couldn't set kernel arg 6! Code " + std::to_string(err));
+
+                // Pass scalar values directly
+                err = clSetKernelArg(warping_kernel, 7, sizeof(float), &tps_x_mean);
+                if (err != CL_SUCCESS)
+                    throw satdump_exception("Couldn't set kernel arg 7! Code " + std::to_string(err));
+
+                err = clSetKernelArg(warping_kernel, 8, sizeof(float), &tps_y_mean);
+                if (err != CL_SUCCESS)
+                    throw satdump_exception("Couldn't set kernel arg 8! Code " + std::to_string(err));
+
+                err = clSetKernelArg(warping_kernel, 9, sizeof(cl_mem), &buffer_img_settings);
+                if (err != CL_SUCCESS)
+                    throw satdump_exception("Couldn't set kernel arg 9! Code " + std::to_string(err));
+                
+                float shift_rad = op.shift_lat * DEG_TO_RAD;
+                float cos_shift = cos(shift_rad);
+                float sin_shift = sin(shift_rad);
+
+                // Set kernel arguments
+                err = clSetKernelArg(warping_kernel, 10, sizeof(float), &cos_shift);
+                if (err != CL_SUCCESS)
+                    throw satdump_exception("Couldn't set kernel arg 10! Code " + std::to_string(err));
+                err = clSetKernelArg(warping_kernel, 11, sizeof(float), &sin_shift);
+                if (err != CL_SUCCESS)
+                    throw satdump_exception("Couldn't set kernel arg 11! Code " + std::to_string(err));
+                
+
+                // Calculate the total number of pixels to process
+                //size_t global_work_size = (size_t)(crop_set.x_max - crop_set.x_min) * (size_t)(crop_set.y_max - crop_set.y_min);
+
+                // Enqueue the kernel
+                //err = clEnqueueNDRangeKernel(queue, warping_kernel, 1, NULL, &global_work_size, NULL, 0, NULL, NULL);
+                //if (err != CL_SUCCESS)
+                //    throw satdump_exception("Couldn't enqueue kernel! Code " + std::to_string(err));
+            
+            
                 // Get proper workload size
                 size_t size_wg = 0;
                 size_t compute_units = 0;
@@ -419,32 +437,57 @@ namespace satdump
                 logger->debug("Workgroup size %d", size_wg * compute_units);
 
                 // Run the kernel!
-                size_t total_wg_size = int(size_wg) * int(compute_units);
-                err = clEnqueueNDRangeKernel(queue, warping_kernel, 1, NULL, &total_wg_size, NULL, 0, NULL, NULL);
+                size_t total_wg_size = int(size_wg) * int(compute_units);            
+            
+                // Calculate total number of pixels to process
+                size_t crop_width = (size_t)(crop_set.x_max - crop_set.x_min);
+                size_t crop_height = (size_t)(crop_set.y_max - crop_set.y_min);
+                size_t total_pixels = crop_width * crop_height;
+
+
+                size_t local_work_size = total_wg_size; // Experiment with different values
+                size_t global_work_size = ((total_pixels + local_work_size - 1) / local_work_size) * local_work_size;
+                
+                logger->debug("Global Work Size %d", global_work_size);
+
+                // Enqueue the kernel
+                err = clEnqueueNDRangeKernel(queue, warping_kernel, 1, NULL, &global_work_size, &local_work_size, 0, NULL, NULL);
                 if (err != CL_SUCCESS)
-                    throw satdump_exception("Couldn't clEnqueueNDRangeKernel! Code " + std::to_string(err));
+                    throw satdump_exception("Couldn't enqueue kernel! Code " + std::to_string(err));
+                //CHECK_CL_ERROR(err, "Couldn't enqueue kernel");
 
-                // Read image result back from VRAM
-                clEnqueueReadBuffer(queue, buffer_map, true, 0, sizeof(uint16_t) * result.output_image.size(), result.output_image.raw_data(), 0, NULL, NULL);
 
-                // Free up everything
+
+                // Wait for kernel execution to finish
+                clFinish(queue);
+
+                // Read the result back to host
+                err = clEnqueueReadBuffer(queue, buffer_map, CL_TRUE, 0, sizeof(uint32_t) * output_image_size, output_image_data.data(), 0, NULL, NULL);
+                if (err != CL_SUCCESS)
+                    throw satdump_exception("Couldn't read buffer_map! Code " + std::to_string(err));
+
+                // Convert output data from uint32_t to uint16_t if necessary
+                uint16_t* output_image_raw_data = static_cast<uint16_t*>(result.output_image.raw_data());
+                for (size_t i = 0; i < output_image_size; ++i) {
+                    output_image_raw_data[i] = static_cast<uint16_t>(output_image_data[i]);
+                }
+
+                // Release resources
                 clReleaseMemObject(buffer_img);
                 clReleaseMemObject(buffer_map);
-                clReleaseMemObject(buffer_tps_npoints);
                 clReleaseMemObject(buffer_tps_x);
                 clReleaseMemObject(buffer_tps_y);
                 clReleaseMemObject(buffer_tps_coefs1);
                 clReleaseMemObject(buffer_tps_coefs2);
-                clReleaseMemObject(buffer_tps_xmean);
-                clReleaseMemObject(buffer_tps_ymean);
                 clReleaseMemObject(buffer_img_settings);
                 clReleaseKernel(warping_kernel);
-                // clReleaseProgram(warping_program);
+                //clReleaseProgram(warping_program);
                 clReleaseCommandQueue(queue);
             }
             auto gpu_time = (std::chrono::system_clock::now() - gpu_start);
             logger->debug("GPU Processing Time %f", gpu_time.count() / 1e9);
         }
+
 #endif
 
         void ImageWarper::update(bool skip_tps)
@@ -458,14 +501,14 @@ namespace satdump
         {
             WarpResult result;
 
-            // Prepare the output
-            result.output_image = image::Image(16, // TODOIMG ALLOW 8-bits
-                                                crop_set.x_max - crop_set.x_min, crop_set.y_max - crop_set.y_min,
-                                                op.output_rgba ? 4 : op.input_image->channels());
-            result.top_left = {0, 0, (double)crop_set.lon_min, (double)crop_set.lat_max};                                                                                  // 0,0
-            result.top_right = {(double)result.output_image.width() - 1, 0, (double)crop_set.lon_max, (double)crop_set.lat_max};                                           // 1,0
-            result.bottom_left = {0, (double)result.output_image.height() - 1, (double)crop_set.lon_min, (double)crop_set.lat_min};                                        // 0,1
-            result.bottom_right = {(double)result.output_image.width() - 1, (double)result.output_image.height() - 1, (double)crop_set.lon_max, (double)crop_set.lat_min}; // 1,1
+            // Prepare the output image with 32 bits per channel
+            result.output_image = image::Image(32,
+                                               crop_set.x_max - crop_set.x_min, crop_set.y_max - crop_set.y_min,
+                                               op.output_rgba ? 4 : op.input_image->channels());
+            result.top_left = {0, 0, (double)crop_set.lon_min, (double)crop_set.lat_max};
+            result.top_right = {(double)result.output_image.width() - 1, 0, (double)crop_set.lon_max, (double)crop_set.lat_max};
+            result.bottom_left = {0, (double)result.output_image.height() - 1, (double)crop_set.lon_min, (double)crop_set.lat_min};
+            result.bottom_right = {(double)result.output_image.width() - 1, (double)result.output_image.height() - 1, (double)crop_set.lon_max, (double)crop_set.lat_min};
 
 #ifdef USE_OPENCL
             if (satdump::opencl::useCL())
@@ -474,15 +517,12 @@ namespace satdump
                 {
                     logger->debug("Using GPU! Double precision requested %d", (int)force_double);
                     satdump::opencl::setupOCLContext();
-                    if (force_double)
-                        warpOnGPU_fp64(result);
-                    else
-                        warpOnGPU_fp32(result);
+                    warpOnGPU_fp32(result);
                     return result;
                 }
                 catch (std::runtime_error &e)
                 {
-                    logger->error("Error warping on GPU : %s", e.what());
+                    logger->error("Error warping on GPU: %s", e.what());
                 }
             }
 #endif
